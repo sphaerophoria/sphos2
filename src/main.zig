@@ -6,6 +6,43 @@ const MB_FLAG_ALIGN = 1 << 0;
 const MB_FLAG_MEMINFO = 1 << 1;
 const FLAGS = MB_FLAG_ALIGN | MB_FLAG_MEMINFO;
 
+const PDE4M = packed struct (u32) {
+    p: u1,
+    rw: u1,
+    us: u1,
+    pwt: u1,
+    pcd: u1,
+    a: u1,
+    d: u1,
+    ps: u1,
+    g: u1,
+    avl: u3,
+    pat: u1,
+    addr_high: u8,
+    rsvd: u1,
+    addr_low: u10,
+};
+
+const PDE4K = packed struct (u32) {
+    p: u1,
+    rw: u1,
+    us: u1,
+    pwt: u1,
+    pcd: u1,
+    a: u1,
+    avl2: u1,
+    ps: u1,
+    avl1: u4,
+    addr: u20,
+};
+
+const PDE = packed union(u32) {
+    large: PDE4M,
+    small: PDE4K,
+};
+
+var page_directory: [1024]PDE align(4096) = undefined;
+
 /// https://www.gnu.org/software/grub/manual/multiboot/multiboot.html#Header-layout
 const MultibootHeader = extern struct {
     magic: u32 = MB_HEADER_MAGIC,
@@ -45,11 +82,14 @@ fn inb(port: u16) u8 {
 // We specify that this function is "naked" to let the compiler know
 // not to generate a standard function prologue and epilogue, since
 // we don't have a stack yet.
-export fn _start() callconv(.naked) noreturn {
+export fn _start() linksection(".early_text") callconv(.naked) noreturn {
+    const stack_ptr: u32 = @intFromPtr(stack_bytes[stack_bytes.len..].ptr);
+    const phys_stack_ptr = stack_ptr - (1 << 31);
+    @setRuntimeSafety(false);
     // We use inline assembly to set up the stack before jumping to
     // our kernel entry point.
     asm volatile (
-        \\ movl %[stack_top], %%esp
+        \\ movl %[stack_top:P], %%esp
         \\ movl %%esp, %%ebp
         \\ call %[kmain:P]
         :
@@ -62,9 +102,9 @@ export fn _start() callconv(.naked) noreturn {
         // extra steps to compute the address at runtime (especially in Debug mode),
         // which could possibly clobber registers that are specified by multiboot
         // to hold special values (e.g. EAX).
-        : [stack_top] "i" (stack_bytes[stack_bytes.len..].ptr),
+        : [stack_top] "X" (@as([*]u8, @ptrFromInt(phys_stack_ptr))),
           // We let the compiler handle the reference to kmain by passing it as an input operand as well.
-          [kmain] "X" (&kmain),
+          [kmain] "X" (&early_kmain),
     );
 }
 
@@ -94,6 +134,14 @@ fn isTransmitEmpty() bool {
    return (inb(serial_port + 5) & 0x20) == 0x20;
 }
 
+fn print(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const to_write = std.fmt.bufPrint(&buf, fmt, args) catch &buf;
+    for (to_write) |c| {
+        writeSerial(c);
+    }
+}
+
 fn writeSerial(c: u8) void {
    while (!isTransmitEmpty()) {}
 
@@ -114,6 +162,7 @@ const GdtEntry = packed struct(u64) {
         access: u8,
         flags: u4,
     };
+
     fn init( args: Init) GdtEntry {
         return .{
             .limit = @truncate(args.limit),
@@ -163,6 +212,21 @@ fn loadGdt(table: []GdtEntry) void {
 }
 
 
+fn enablePaging(addr: u32) linksection(".early_text") void {
+    asm volatile(
+        \\mov %cr4, %ecx
+        \\or $0x00000010, %ecx
+        \\mov %ecx, %cr4
+        \\mov %[val], %cr3
+        \\movl %cr0, %ecx
+	\\orl $0x80010000, %ecx
+	\\movl %ecx, %cr0
+        :
+        : [val] "r" (addr),
+        : .{ .ecx = true }
+    );
+}
+
 //0x0000    Null Descriptor     Base = 0
 //Limit = 0x00000000
 //Access Byte = 0x00
@@ -181,6 +245,35 @@ fn loadGdt(table: []GdtEntry) void {
 //Flags = 0x0
 
 
+noinline fn early_kmain() linksection(".early_text") callconv(.c) noreturn {
+    // FIXME: This should only be done for the kernel and should map high ->
+    // low, but that's for later
+    const alternate_ptr: [*]PDE = @ptrFromInt(@as(u32, @intFromPtr(&page_directory)) - (1 << 31));
+    for (alternate_ptr[0..1024], 0..) |*entry, i| {
+        entry.* = .{
+            .large = .{
+                .rsvd = 0,
+                .avl = 0,
+                .p = 1,
+                .rw = 1,
+                .us = 1,
+                .pwt = 0,
+                .pcd = 0,
+                .a = 0,
+                .d = 0,
+                .ps = 1,
+                .g = 0,
+                .pat = 0,
+                .addr_low = @intCast(i % 512),
+                .addr_high = 0,
+            },
+        };
+    }
+
+    enablePaging(@intFromPtr(alternate_ptr));
+
+    kmain();
+}
 
 // We use noinline to make sure it don't get inlined by compiler
 noinline fn kmain() callconv(.c) noreturn {
@@ -189,6 +282,30 @@ noinline fn kmain() callconv(.c) noreturn {
     //// Printing string
     //console.print("Hello {s} kernel!", .{"zig"});
 
+    // FIXME: This should only be done for the kernel and should map high ->
+    // low, but that's for later
+    //for (&page_directory, 0..) |*entry, i| {
+    //    entry.* = .{
+    //        .large = .{
+    //            .rsvd = 0,
+    //            .avl = 0,
+    //            .p = 1,
+    //            .rw = 1,
+    //            .us = 1,
+    //            .pwt = 0,
+    //            .pcd = 0,
+    //            .a = 0,
+    //            .d = 0,
+    //            .ps = 1,
+    //            .g = 0,
+    //            .pat = 0,
+    //            .addr_low = @intCast(i % 512),
+    //            .addr_high = 0,
+    //        },
+    //    };
+    //}
+
+    // FIXME: We might need some form of GDT enabled before paging in early kmain, unsure
     gdt = .{
         .init(.{ .base = 0, .limit = 0, .access = 0, .flags = 0}),
         .init(.{ .base = 0, .limit = 0xfffff, .access = 0x9a, .flags = 0xc}),
@@ -199,9 +316,27 @@ noinline fn kmain() callconv(.c) noreturn {
 
     initSerial();
 
-    for ("hello\n") |c| {
-        writeSerial(c);
-    }
+    print("hello\n", .{});
+    //for (&page_directory) |entry| {
+    //    print("0x{x} -> {any}\n", .{@as(u32, @bitCast(entry)), entry.large});
+    //}
+
+    //enablePaging(@intFromPtr(&page_directory));
+
+    //const alternate_ptr: [*]PDE = @ptrFromInt(@as(u32, @intFromPtr(&page_directory)) + (1 << 31));
+    //print("{*} / {*}\n", .{&page_directory, alternate_ptr});
+
+    //for (&page_directory, alternate_ptr[0..1024]) |entry, entry2| {
+    //    const entry_bits: u32 = @bitCast(entry);
+    //    const entry2_bits: u32 = @bitCast(entry2);
+    //    if (entry_bits != entry2_bits)  {
+    //        print("fuck ggs its over\n", .{});
+    //        asm volatile ("hlt");
+    //    }
+    //}
+
+    print("hello2\n", .{});
+
     while (true) {
         asm volatile ("hlt");
     }

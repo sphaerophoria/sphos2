@@ -18,28 +18,34 @@ SECTIONS {
        chosen as a safer option than the traditional 1M. */
     . = 2M;
 
+    .early_text : ALIGN(4K) {
+        KEEP(*(.multiboot))
+        *(.early_text)
+    }
+
+    . += 0x80000000;
+
     /* First put the multiboot header, as it is required to be put very early
        in the image or the bootloader won't recognize the file format. Next
        we'll put the .text section. */
-    .text : ALIGN(4K) {
+    .text ALIGN(4K) : AT (ADDR (.text) - 0x80000000) {
         /* We need to specify KEEP to prevent the linker from removing the
            multiboot section. */
-        KEEP(*(.multiboot))
         *(.text)
     }
 
     /* Read-only data. */
-    .rodata : ALIGN(4K) {
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - 0x80000000) {
         *(.rodata)
     }
 
     /* Read-write data (initialized) */
-    .data : ALIGN(4K) {
+    .data ALIGN(4K) : AT(ADDR(.data) - 0x80000000) {
         *(.data)
     }
 
     /* Read-write data (uninitialized i.e. undefined) */
-    .bss : ALIGN(4K) {
+    .bss ALIGN(4K) : AT(ADDR(.bss) - 0x80000000) {
         *(COMMON)
         *(.bss)
     }
